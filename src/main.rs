@@ -13,6 +13,7 @@ mod icon;
 mod injector;
 mod joystick;
 mod lcd;
+mod macros;
 mod led;
 mod monitor;
 mod profiles;

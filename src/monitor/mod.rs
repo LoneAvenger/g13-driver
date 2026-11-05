@@ -11,8 +11,20 @@ use crate::dispatcher::Dispatcher;
 use crate::injector::{KeyCombo, key_map::build_key_map, windows::WindowsInjector};
 use crate::protocol::{G13Event, G13Key, MKey};
 
-/// A combo is valid for the editor only if it parses AND its key is a known key
-/// (so `ctrl+zzz` is rejected here rather than silently failing at injection).
+mod capture;
+mod theme;
+use capture::{CaptureResult, KeyCapture};
+
+/// Which editor row a key capture is filling in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTarget {
+    Key(G13Key),
+    Joy(usize),
+}
+
+/// A single combo is valid for the editor only if it parses AND its key is a
+/// known key (so `ctrl+zzz` is rejected here rather than silently failing at
+/// injection). Joystick directions use this (they can't run macros).
 fn combo_valid(s: &str, valid_keys: &HashSet<String>) -> bool {
     match KeyCombo::parse(s) {
         Ok(c) => match &c.key {
@@ -76,8 +88,11 @@ fn toggle_main_window() {
     }
 }
 
-/// One Bindings-tab mapping row (shared by G-keys, thumb buttons, joystick):
-/// right-aligned name, key/combo field, validity mark, label field, repeat checkbox.
+/// One Bindings-tab mapping row, laid out as a grid row:
+/// name · binding field · Set · clear · status · label · repeat.
+/// `capturing` is Some(preview) while this row is waiting for a key press.
+/// Returns true when the user clicked **Set** for this row.
+#[allow(clippy::too_many_arguments)]
 fn render_mapping_row(
     ui: &mut egui::Ui,
     name: &str,
@@ -85,42 +100,81 @@ fn render_mapping_row(
     label_buf: &mut String,
     repeat_buf: &mut bool,
     valid_keys: &HashSet<String>,
-) {
-    let green = egui::Color32::from_rgb(127, 224, 160);
-    let red = egui::Color32::from_rgb(220, 90, 90);
-    let dim = egui::Color32::from_gray(110);
-    ui.horizontal(|ui| {
-        ui.monospace(format!("{name:>5}"));
-        ui.add_space(6.0);
-        ui.add(egui::TextEdit::singleline(key_buf).desired_width(160.0));
-        let (mark, color) = if key_buf.is_empty() {
-            ("—", dim)
-        } else if combo_valid(key_buf, valid_keys) {
-            ("ok", green)
-        } else {
-            ("bad", red)
-        };
-        ui.colored_label(color, mark);
-        ui.add(egui::TextEdit::singleline(label_buf)
-            .desired_width(140.0).hint_text("label (optional)"));
-        ui.checkbox(repeat_buf, "repeat");
-    });
+    allow_macro: bool,
+    capturing: Option<&str>,
+) -> bool {
+    use theme::{ACCENT, ACCENT_DIM, BAD, GOOD, MUTED};
+    let mut start_capture = false;
+
+    ui.add_sized([46.0, 24.0], egui::Label::new(egui::RichText::new(name).monospace().strong()));
+
+    if let Some(preview) = capturing {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(170.0, 24.0), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect(rect, egui::CornerRadius::same(6), ACCENT_DIM,
+               egui::Stroke::new(1.0_f32, ACCENT), egui::StrokeKind::Inside);
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, preview,
+               egui::FontId::proportional(13.0), egui::Color32::WHITE);
+        ui.label(egui::RichText::new("Esc = cancel").small().color(MUTED));
+    } else {
+        let field = ui.add_sized([170.0, 24.0], egui::TextEdit::singleline(key_buf)
+            .vertical_align(egui::Align::Center)
+            .hint_text("unmapped"));
+        if !key_buf.trim().is_empty() {
+            field.on_hover_text(capture::pretty(key_buf));
+        }
+        if ui.button("Set key").on_hover_text("Click, then press the key or combo \
+            (Space, Ctrl on its own, Ctrl+1…)").clicked() {
+            start_capture = true;
+        }
+    }
+
+    if ui.add_enabled(!key_buf.is_empty() && capturing.is_none(),
+                      egui::Button::new("×").frame(false))
+        .on_hover_text("Unmap").clicked() {
+        key_buf.clear();
+    }
+
+    let is_macro = crate::macros::is_macro(key_buf);
+    if key_buf.trim().is_empty() {
+        ui.label(egui::RichText::new("—").color(MUTED));
+    } else if is_macro && !allow_macro {
+        theme::pill(ui, "no macros", BAD);
+    } else if is_macro {
+        if crate::macros::binding_valid(key_buf, valid_keys) { theme::pill(ui, "macro", ACCENT); }
+        else { theme::pill(ui, "bad", BAD); }
+    } else if combo_valid(key_buf, valid_keys) {
+        theme::pill(ui, "ok", GOOD);
+    } else {
+        theme::pill(ui, "bad", BAD);
+    }
+
+    ui.add_sized([130.0, 24.0], egui::TextEdit::singleline(label_buf)
+        .vertical_align(egui::Align::Center).hint_text("label"));
+    ui.checkbox(repeat_buf, "repeat")
+        .on_hover_text("Auto-repeat while held (for a macro: loop it while held)");
+    ui.end_row();
+    start_capture
 }
 
-fn render_binding_row(
-    ui: &mut egui::Ui,
-    key: G13Key,
-    edits: &mut HashMap<G13Key, String>,
-    repeat_edits: &mut HashMap<G13Key, bool>,
-    label_edits: &mut HashMap<G13Key, String>,
-    valid_keys: &HashSet<String>,
-) {
-    let name = format!("{key:?}");
-    // Separate HashMaps → three independent &mut borrows, no aliasing.
-    let key_buf = edits.entry(key).or_default();
-    let label_buf = label_edits.entry(key).or_default();
-    let repeat_buf = repeat_edits.entry(key).or_default();
-    render_mapping_row(ui, &name, key_buf, label_buf, repeat_buf, valid_keys);
+/// Tidy a binding for saving: single combos become canonical ("Ctrl + 1" ->
+/// "ctrl+1", " " -> "space"); macros and unparseable text are kept as typed.
+fn normalise_binding(s: &str) -> String {
+    if crate::macros::is_macro(s) { return s.trim().to_string(); }
+    match KeyCombo::parse(s) {
+        Ok(c) => c.to_canonical(),
+        Err(_) => s.trim().to_string(),
+    }
+}
+
+/// Is this binding text acceptable for the given row kind?
+fn row_valid(s: &str, valid_keys: &HashSet<String>, allow_macro: bool) -> bool {
+    if s.trim().is_empty() { return true; }
+    if crate::macros::is_macro(s) {
+        allow_macro && crate::macros::binding_valid(s, valid_keys)
+    } else {
+        combo_valid(s, valid_keys)
+    }
 }
 
 pub fn run(config: Arc<RwLock<ProfileSet>>, config_path: std::path::PathBuf, start_minimized: bool) -> Result<()> {
@@ -128,11 +182,12 @@ pub fn run(config: Arc<RwLock<ProfileSet>>, config_path: std::path::PathBuf, sta
     let start_active = config.read().unwrap().start_active();
     let dry_run = Arc::new(AtomicBool::new(!start_active));
 
-    // Fixed, non-resizable window sized to fit the content of every tab.
+    // Resizable window, with a minimum that fits the content of every tab.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([660.0, 560.0])
-            .with_resizable(false)
+            .with_inner_size([880.0, 700.0])
+            .with_min_inner_size([780.0, 560.0])
+            .with_resizable(true)
             .with_visible(!start_minimized)
             .with_icon(std::sync::Arc::new({
                 let (rgba, width, height) = crate::icon::render_g13_rgba(4, [230, 230, 230, 255], [24, 24, 24, 255]);
@@ -224,6 +279,9 @@ pub struct MonitorApp {
     catalog_status: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pending_revert: Option<(std::path::PathBuf, String)>,
     tracker: Arc<Mutex<crate::lcd::ActivityTracker>>,
+    /// Bindings-tab "press a key" capture in progress, and its live preview text.
+    capture: Option<(CaptureTarget, KeyCapture)>,
+    capture_preview: String,
 }
 
 impl MonitorApp {
@@ -239,7 +297,10 @@ impl MonitorApp {
         let quit = Arc::new(AtomicBool::new(false));
         let window_visible = Arc::new(AtomicBool::new(!start_minimized));
         #[cfg_attr(not(windows), allow(unused_mut))]
+        theme::apply(&cc.egui_ctx);
         let mut app = Self {
+            capture: None,
+            capture_preview: String::new(),
             profiles,
             state,
             dry_run,
@@ -561,6 +622,33 @@ impl eframe::App for MonitorApp {
             self.window_visible.store(false, Ordering::Relaxed);
         }
 
+        // Key capture for the Bindings editor: while active, swallow this
+        // frame's input so the keypress reaches us, not whatever widget has
+        // focus (otherwise Space "clicks" the focused button and Ctrl does nothing).
+        let mut capture_done: Option<(CaptureTarget, Option<String>)> = None;
+        if let Some((target, cap)) = self.capture.as_mut() {
+            let (events, mods) = ctx.input_mut(|i| (std::mem::take(&mut i.events), i.modifiers));
+            match cap.feed(&events, mods) {
+                CaptureResult::Pending => {
+                    self.capture_preview = cap.preview(mods);
+                    ctx.request_repaint_after(Duration::from_millis(30));
+                }
+                CaptureResult::Done(binding) => capture_done = Some((*target, Some(binding))),
+                CaptureResult::Cancelled => capture_done = Some((*target, None)),
+            }
+        }
+        if let Some((target, result)) = capture_done {
+            self.capture = None;
+            if let Some(binding) = result {
+                match target {
+                    CaptureTarget::Key(k) => { self.edits.insert(k, binding); }
+                    CaptureTarget::Joy(i) => { self.joy_edits[i] = binding; }
+                }
+                self.save_status = Some("changed — click Save to apply".to_string());
+            }
+        }
+        if self.tab != Tab::Bindings { self.capture = None; }
+
         let snapshot = self.state.lock().unwrap().clone();
 
         // Persist a mode change (from any surface: header, Settings, tray).
@@ -582,24 +670,29 @@ impl eframe::App for MonitorApp {
         }
 
         egui::TopBottomPanel::top("hd").show(ctx, |ui| {
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.heading("G13 Monitor");
+                ui.label(egui::RichText::new("G13").heading().strong().color(theme::ACCENT));
+                ui.label(egui::RichText::new("Driver").heading().color(theme::TEXT));
+                ui.add_space(8.0);
                 match &snapshot.connection {
-                    Connection::Connected => ui.colored_label(egui::Color32::from_rgb(95, 214, 138), "● Connected"),
-                    Connection::Disconnected(why) => ui.colored_label(egui::Color32::from_rgb(220, 90, 90), format!("○ {why}")),
+                    Connection::Connected => theme::pill(ui, "● connected", theme::GOOD),
+                    Connection::Disconnected(why) => theme::pill(ui, &format!("○ {why}"), theme::BAD),
                 };
                 if let Some(name) = self.profiles.read().unwrap().active_name() {
-                    ui.separator();
-                    ui.label(format!("Profile: {name}"));
+                    ui.label(egui::RichText::new(format!("Profile: {name}")).color(theme::MUTED));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut active = !self.dry_run.load(Ordering::Relaxed);
-                    if ui.selectable_label(active, "Active").clicked() { active = true; }
-                    else if ui.selectable_label(!active, "Dry-run").clicked() { active = false; }
+                    let on = egui::RichText::new("Active").strong();
+                    if ui.selectable_label(active, if active { on.color(theme::GOOD) } else { on })
+                        .on_hover_text("Bindings are sent to your games/apps").clicked() { active = true; }
+                    else if ui.selectable_label(!active, "Dry-run")
+                        .on_hover_text("Shows presses but sends nothing").clicked() { active = false; }
                     self.dry_run.store(!active, Ordering::Relaxed);
-                    ui.label("mode:");
                 });
             });
+            ui.add_space(4.0);
         });
 
         egui::TopBottomPanel::bottom("ft").show(ctx, |ui| {
@@ -612,10 +705,18 @@ impl eframe::App for MonitorApp {
             ui.label(format!("config.toml · {joy}"));
         });
 
-        egui::SidePanel::left("nav").resizable(false).min_width(104.0).show(ctx, |ui| {
-            ui.add_space(6.0);
+        egui::SidePanel::left("nav").resizable(false).exact_width(118.0)
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::same(8)))
+            .show(ctx, |ui| {
+            ui.add_space(4.0);
             for (tab, label) in TABS {
-                if ui.selectable_label(self.tab == tab, label).clicked() {
+                let selected = self.tab == tab;
+                let text = if selected {
+                    egui::RichText::new(label).strong().color(theme::ACCENT)
+                } else {
+                    egui::RichText::new(label).color(theme::TEXT)
+                };
+                if ui.add_sized([102.0, 30.0], egui::SelectableLabel::new(selected, text)).clicked() {
                     self.tab = tab;
                 }
             }
@@ -623,7 +724,10 @@ impl eframe::App for MonitorApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.tab {
-                Tab::Monitor => self.render_monitor(ui, &snapshot),
+                Tab::Monitor => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false])
+                        .show(ui, |ui| self.render_monitor(ui, &snapshot));
+                }
                 Tab::Profiles => self.render_profiles(ui),
                 Tab::Bindings => self.render_bindings(ui),
                 Tab::Catalog => self.render_catalog(ui),
@@ -726,10 +830,10 @@ impl MonitorApp {
                         let size = egui::vec2(140.0, 140.0);
                         let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
                         let rect = resp.rect;
-                        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
+                        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
                         let c = rect.center();
                         let dz_r = rect.width() * (dz as f32 / 255.0);
-                        painter.circle_stroke(c, dz_r, egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
+                        painter.circle_stroke(c, dz_r, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)));
                         let px = rect.left() + rect.width() * (snapshot.joy_x as f32 / 255.0);
                         let py = rect.top() + rect.height() * (snapshot.joy_y as f32 / 255.0);
                         painter.circle_filled(egui::pos2(px, py), 6.0, egui::Color32::from_rgb(127, 224, 160));
@@ -748,10 +852,11 @@ impl MonitorApp {
                             }
                         };
                         ui.horizontal(|ui| {
-                            show(ui, "↑", &up, a_up);
-                            show(ui, "↓", &down, a_down);
-                            show(ui, "←", &left, a_left);
-                            show(ui, "→", &right, a_right);
+                            // Words, not arrow glyphs: egui's bundled font has no arrows.
+                            show(ui, "up ", &up, a_up);
+                            show(ui, "down ", &down, a_down);
+                            show(ui, "left ", &left, a_left);
+                            show(ui, "right ", &right, a_right);
                         });
                     });
                 });
@@ -1116,13 +1221,14 @@ impl MonitorApp {
 
         let red = egui::Color32::from_rgb(220, 90, 90);
         let valid_keys: HashSet<String> = build_key_map().into_keys().collect();
-        let all_valid = self.edits.values().all(|b| b.is_empty() || combo_valid(b, &valid_keys));
+        let all_valid = self.edits.values().all(|b| row_valid(b, &valid_keys, true))
+            && self.joy_edits.iter().all(|b| row_valid(b, &valid_keys, false));
 
         // Pinned action bar — always visible regardless of window height.
         egui::TopBottomPanel::bottom("bindings_actions").show_inside(ui, |ui| {
             ui.add_space(4.0);
             if !all_valid {
-                ui.colored_label(red, "Fix the invalid (bad) combos before saving.");
+                ui.colored_label(red, "Fix the rows marked \"bad\" before saving.");
             }
             if is_github && is_modified {
                 if let (Some(origin), Some(path)) = (origin.clone(), active_path.clone()) {
@@ -1132,10 +1238,16 @@ impl MonitorApp {
                 }
             }
             ui.horizontal(|ui| {
-                if ui.add_enabled(all_valid, egui::Button::new("Save")).clicked() {
+                let save_btn = egui::Button::new(egui::RichText::new("Save").strong()
+                        .color(if all_valid { egui::Color32::BLACK } else { theme::MUTED }))
+                    .fill(if all_valid { theme::ACCENT } else { theme::CARD })
+                    .min_size(egui::vec2(90.0, 28.0));
+                if ui.add_enabled(all_valid, save_btn).clicked() {
+                    // Store bindings in tidy canonical form ("Ctrl + 1" -> "ctrl+1");
+                    // macros are kept as typed.
                     let bindings: HashMap<G13Key, String> = self.edits.iter()
-                        .filter(|(_, v)| !v.is_empty())
-                        .map(|(k, v)| (*k, v.clone()))
+                        .filter(|(_, v)| !v.trim().is_empty())
+                        .map(|(k, v)| (*k, normalise_binding(v)))
                         .collect();
                     let repeat: HashMap<G13Key, bool> = self.repeat_edits.iter()
                         .filter(|(_, &v)| v)
@@ -1145,7 +1257,7 @@ impl MonitorApp {
                         .filter(|(_, v)| !v.trim().is_empty())
                         .map(|(k, v)| (*k, v.clone()))
                         .collect();
-                    let mk = |s: &str| -> Option<String> { let s = s.trim(); if s.is_empty() { None } else { Some(s.to_string()) } };
+                    let mk = |s: &str| -> Option<String> { if s.trim().is_empty() { None } else { Some(normalise_binding(s)) } };
                     let jc = JoystickConfig {
                         up: mk(&self.joy_edits[0]), down: mk(&self.joy_edits[1]),
                         left: mk(&self.joy_edits[2]), right: mk(&self.joy_edits[3]),
@@ -1186,11 +1298,12 @@ impl MonitorApp {
         });
 
         // Central content (fills the space above the pinned action bar).
-        ui.heading("Bindings");
-        match &active_name {
-            Some(n) => ui.label(format!("Editing profile: {n}")),
-            None => ui.label("No profile loaded"),
-        };
+        ui.horizontal(|ui| {
+            ui.heading("Bindings");
+            if let Some(n) = &active_name {
+                ui.label(egui::RichText::new(format!("· {n}")).color(theme::MUTED));
+            }
+        });
         if is_github {
             if is_modified {
                 ui.weak("From GitHub · edited — your changes differ from the downloaded version.");
@@ -1198,33 +1311,82 @@ impl MonitorApp {
                 ui.weak("From GitHub — your edits will mark this profile as edited.");
             }
         }
-        ui.weak("Combo = optional modifiers (ctrl / shift / alt / win) + one key, held while \
-                 the G-key is held. Examples: ctrl+c, ctrl+shift+z, win+d. Modifiers alone are \
-                 allowed (e.g. shift, ctrl+shift). Keys: a-z, 0-9, f1-f24, enter, esc, space, \
-                 tab, arrows, home/end, pageup/pagedown, insert/delete, and media: playpause, \
-                 nexttrack, prevtrack, volup, voldown, mute (media keys tap). Empty = unmapped.");
-        ui.weak("Tick 'repeat' to auto-repeat a key while held (like a keyboard). Repeat \
-                 timing (delay/rate) is set in config.toml under [autorepeat].");
-        ui.add_space(6.0);
+        ui.label(egui::RichText::new(
+            "Click Set key and press what you want — Space, Ctrl on its own, Ctrl+1… \
+             Keys are held for as long as you hold the G-key.").color(theme::MUTED));
+        egui::CollapsingHeader::new("Key names, combos & macros").id_salt("bind_help").show(ui, |ui| {
+            ui.label("You can also type a binding. Combos are modifiers + one key: ctrl+1, \
+                      ctrl+shift+z, alt+f4. A modifier alone (ctrl, shift, alt) is fine.");
+            ui.label("Keys: a–z, 0–9, f1–f24, space, enter, esc, tab, backspace, arrows (up/down/left/right), \
+                      home, end, pageup, pagedown, insert, delete, num0–num9, numplus, numminus, \
+                      minus, equals, comma, period, slash, semicolon, quote, hash, lbracket, rbracket, \
+                      grave, rctrl, rshift, ralt, capslock, and media keys (playpause, nexttrack, \
+                      prevtrack, volup, voldown, mute — these tap).");
+            ui.label(egui::RichText::new("Macros").strong());
+            ui.label("Separate steps with commas. Each key is tapped in turn; add pauses with \
+                      \"wait 200\" (milliseconds). Example:  ctrl+1, wait 150, ctrl+2, wait 150, ctrl+3");
+            ui.label("Tick repeat on a macro to loop it while the G-key is held. \
+                      Joystick directions take a single key, not macros.");
+        });
+        ui.add_space(4.0);
+
+        let capturing = self.capture.as_ref().map(|(t, _)| *t);
+        let preview = self.capture_preview.clone();
+        let mut start_capture: Option<CaptureTarget> = None;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for &key in ROWS.iter().flat_map(|row| row.iter()) {
-                render_binding_row(ui, key, &mut self.edits, &mut self.repeat_edits, &mut self.label_edits, &valid_keys);
-            }
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label("Thumb buttons");
-            for &key in THUMB.iter() {
-                render_binding_row(ui, key, &mut self.edits, &mut self.repeat_edits, &mut self.label_edits, &valid_keys);
-            }
-            ui.add_space(6.0);
-            ui.separator();
-            ui.label("Joystick");
-            for (i, name) in ["Up", "Down", "Left", "Right"].into_iter().enumerate() {
-                render_mapping_row(ui, name, &mut self.joy_edits[i], &mut self.joy_label_edits[i],
-                    &mut self.joy_repeat_edits[i], &valid_keys);
-            }
+            let edits = &mut self.edits;
+            let repeat_edits = &mut self.repeat_edits;
+            let label_edits = &mut self.label_edits;
+            let mut key_rows = |ui: &mut egui::Ui, id: &str, keys: &mut dyn Iterator<Item = G13Key>| {
+                egui::Grid::new(id).num_columns(7).spacing([8.0, 6.0]).striped(true).show(ui, |ui| {
+                    for key in keys {
+                        let target = CaptureTarget::Key(key);
+                        let cap = (capturing == Some(target)).then_some(preview.as_str());
+                        let key_buf = edits.entry(key).or_default();
+                        let label_buf = label_edits.entry(key).or_default();
+                        let repeat_buf = repeat_edits.entry(key).or_default();
+                        if render_mapping_row(ui, &format!("{key:?}"), key_buf, label_buf, repeat_buf,
+                                              &valid_keys, true, cap) {
+                            start_capture = Some(target);
+                        }
+                    }
+                });
+            };
+
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::section(ui, "G-keys");
+                key_rows(ui, "grid_gkeys", &mut ROWS.iter().flat_map(|row| row.iter()).copied());
+            });
+            ui.add_space(8.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::section(ui, "Thumb buttons");
+                key_rows(ui, "grid_thumb", &mut THUMB.iter().copied());
+            });
+            ui.add_space(8.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::section(ui, "Joystick");
+                egui::Grid::new("grid_joy").num_columns(7).spacing([8.0, 6.0]).striped(true).show(ui, |ui| {
+                    for (i, name) in ["Up", "Down", "Left", "Right"].into_iter().enumerate() {
+                        let target = CaptureTarget::Joy(i);
+                        let cap = (capturing == Some(target)).then_some(preview.as_str());
+                        if render_mapping_row(ui, name, &mut self.joy_edits[i], &mut self.joy_label_edits[i],
+                                              &mut self.joy_repeat_edits[i], &valid_keys, false, cap) {
+                            start_capture = Some(target);
+                        }
+                    }
+                });
+            });
         });
+
+        if let Some(target) = start_capture {
+            ui.ctx().memory_mut(|m| m.stop_text_input());
+            self.capture_preview = "press a key…".to_string();
+            self.capture = Some((target, KeyCapture::new()));
+        }
 
         if let Some((path, origin)) = self.pending_revert.clone() {
             let mut go = false;
@@ -1594,13 +1756,24 @@ impl MonitorApp {
                 joystick light up as you press them. Safe to use in Dry-run.");
             ui.label("Profiles — the M1/M2/M3 slots, each backed by its own profile file in a \
                 folder. Switch the active profile with the M-keys on the device or from this tab.");
-            ui.label("Bindings — edit the active profile: for each G-key, thumb button and \
-                joystick direction you can set a key or combo, an optional label, and an \
-                auto-repeat toggle.");
+            ui.label("Bindings — edit the active profile: click Set key and press any key or \
+                combo (Space, Ctrl on its own, Ctrl+1…), or type it. G-keys and thumb buttons \
+                can also run macros. Each row has an optional label and a repeat toggle.");
             ui.label("Catalog — browse, download and revert community-shared profiles.");
             ui.label("LCD — choose what each of the 3 LCD lines shows, with a live preview.");
             ui.label("Settings — backlight color (per profile) and brightness, the M-key \
                 indicator, joystick deadzone, launch-at-login, and update checks.");
+            ui.add_space(6.0);
+
+            ui.heading("Games & push-to-talk");
+            ui.label("Keys are sent as real keyboard scancodes, so games that read the \
+                keyboard directly (WoW, Discord push-to-talk, etc.) see them like a normal key. \
+                A G-key bound to ctrl or space holds that key down for exactly as long as you \
+                hold the G-key — perfect for push-to-talk.");
+            ui.label("If a game or app ignores the pad, check whether it runs as Administrator: \
+                Windows blocks input from a normal app to an admin one. Run both the same way.");
+            ui.label("Macros: separate steps with commas, e.g. ctrl+1, wait 150, ctrl+2. Some games \
+                have rules about automation — keep macros to what the game allows.");
             ui.add_space(6.0);
 
             ui.heading("Tray & window");

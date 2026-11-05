@@ -6,6 +6,7 @@ use crate::config::{JoystickDir, ProfileSet};
 use crate::injector::{KeyCombo, KeyInjector};
 use crate::injector::key_map::tap_only_keys;
 use crate::joystick::{HoldAction, JoystickMapper};
+use crate::macros::{self, Macro, MacroHandle};
 use crate::protocol::{G13Event, G13Key, MKey};
 
 /// A currently-held key binding plus its auto-repeat schedule.
@@ -27,8 +28,11 @@ struct JoyHeld {
 
 pub struct Dispatcher {
     profiles: Arc<RwLock<ProfileSet>>,
-    injector: Box<dyn KeyInjector>,
+    injector: Arc<dyn KeyInjector>,
     joystick: JoystickMapper,
+    /// Macros started by a G-key; kept so a held repeat-macro can be stopped on
+    /// release and so a second press doesn't start an overlapping copy.
+    macros: HashMap<G13Key, MacroHandle>,
     held_keys: HashMap<G13Key, HeldKey>,
     joystick_held: HashMap<crate::config::JoystickDir, JoyHeld>,
     tap_only: HashSet<String>,
@@ -38,8 +42,9 @@ impl Dispatcher {
     pub fn new(profiles: Arc<RwLock<ProfileSet>>, injector: Box<dyn KeyInjector>) -> Self {
         Self {
             profiles,
-            injector,
+            injector: Arc::from(injector),
             joystick: JoystickMapper::new(),
+            macros: HashMap::new(),
             held_keys: HashMap::new(),
             joystick_held: HashMap::new(),
             tap_only: tap_only_keys(),
@@ -70,6 +75,16 @@ impl Dispatcher {
             return;
         };
         log::debug!("{key:?} -> {binding}");
+        if macros::is_macro(&binding) {
+            if self.macros.get(&key).is_some_and(|h| !h.is_done()) {
+                return; // still playing — don't overlap
+            }
+            match Macro::parse(&binding) {
+                Ok(m) => { self.macros.insert(key, macros::spawn(m, self.injector.clone(), repeat)); }
+                Err(e) => log::warn!("bad macro {binding:?}: {e:#}"),
+            }
+            return;
+        }
         let combo = match KeyCombo::parse(&binding) {
             Ok(c) => c,
             Err(e) => { log::warn!("bad binding {binding:?}: {e:#}"); return; }
@@ -97,6 +112,9 @@ impl Dispatcher {
     }
 
     fn handle_key_up(&mut self, key: G13Key) {
+        if let Some(h) = self.macros.get(&key) {
+            h.stop(); // only affects repeating macros; one-shots play to the end
+        }
         if let Some(held) = self.held_keys.remove(&key) {
             if let Err(e) = self.injector.combo_up(&held.combo) {
                 log::warn!("injection failed: {e:#}");
@@ -228,6 +246,7 @@ impl Dispatcher {
     /// Active->Dry-run, USB disconnect, and shutdown so nothing sticks.
     pub fn release_held(&mut self) {
         self.release_joystick();
+        for h in self.macros.values() { h.stop(); }
         for (_key, held) in self.held_keys.drain() {
             if let Err(e) = self.injector.combo_up(&held.combo) {
                 log::warn!("injection failed on release: {e:#}");
@@ -464,6 +483,35 @@ mod tests {
         assert!(ups.lock().unwrap().is_empty());
         d.handle(G13Event::KeyUp(G13Key::G1)).unwrap();
         assert_eq!(ups.lock().unwrap()[0].key.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn push_to_talk_ctrl_and_space_hold_while_pressed() {
+        for binding in ["ctrl", "space", "Space", "ctrl+1"] {
+            let (injector, downs, ups) = MockInjector::new_combos();
+            let mut d = Dispatcher::new(make_config(&[("G1", binding)]), Box::new(injector));
+            d.handle(G13Event::KeyDown(G13Key::G1)).unwrap();
+            assert_eq!(downs.lock().unwrap().len(), 1, "{binding}");
+            assert!(ups.lock().unwrap().is_empty(), "{binding} released too early");
+            d.handle(G13Event::KeyUp(G13Key::G1)).unwrap();
+            assert_eq!(ups.lock().unwrap().len(), 1, "{binding}");
+            assert_eq!(downs.lock().unwrap()[0], ups.lock().unwrap()[0]);
+        }
+    }
+
+    #[test]
+    fn gkey_runs_macro_in_background() {
+        let (injector, downs, ups) = MockInjector::new_combos();
+        let mut d = Dispatcher::new(make_config(&[("G1", "ctrl+1, wait 10, ctrl+2")]), Box::new(injector));
+        d.handle(G13Event::KeyDown(G13Key::G1)).unwrap();
+        d.handle(G13Event::KeyUp(G13Key::G1)).unwrap(); // quick tap still plays it all
+        let t = std::time::Instant::now();
+        while ups.lock().unwrap().len() < 2 {
+            assert!(t.elapsed() < Duration::from_secs(5), "macro didn't finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let d2: Vec<String> = downs.lock().unwrap().iter().map(|c| c.to_canonical()).collect();
+        assert_eq!(d2, vec!["ctrl+1", "ctrl+2"]);
     }
 
     #[test]

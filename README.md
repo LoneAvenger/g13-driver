@@ -10,7 +10,9 @@ official software is abandonware; this brings the G13 back to life with a small,
 ## What it does
 
 - Remap the **G-keys** (G1–G22), the two **thumb buttons**, and the **joystick click** to any key
-  or keyboard shortcut (e.g. `ctrl+c`, `alt+tab`).
+  or shortcut — just click **Set key** and press it (`Space`, `Ctrl` on its own, `Ctrl+1`…).
+- **Macros**: `ctrl+1, wait 150, ctrl+2` — tap to play once, or loop while held.
+- Keys are sent as real **scancodes**, so games that read the keyboard directly see them.
 - Map the **joystick** to WASD (hold-to-move).
 - **Profiles** on the M1/M2/M3 keys — switch whole binding sets on the fly.
 - Runs quietly in the **system tray**; optional **auto-start at login**.

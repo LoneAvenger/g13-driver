@@ -62,24 +62,57 @@ case-insensitive.
 
 ### Binding syntax
 
-A binding is optional **modifiers** + one **key**: `modifier+modifier+key`. Modifiers: `ctrl`,
-`shift`, `alt`, `win` (aliases `control`, `windows`, `super`). Examples: `a`, `ctrl+c`, `ctrl+shift+z`,
-`win+d`. A modifier **alone** is allowed (e.g. `shift`). Bindings are **hold-means-hold** (held
-while the G-key is held); multimedia keys are the tap-only exception.
+The easy way: on the **Bindings** tab click **Set key** and press the key or combo — `Space`,
+`Ctrl` on its own, `Ctrl+1`, `Ctrl+Shift+F5`… Press a modifier and let go of it with nothing
+else to bind just that modifier (handy for push-to-talk). `Esc` or a click cancels.
+
+By hand, a binding is optional **modifiers** + one **key**: `modifier+modifier+key`. Modifiers:
+`ctrl`, `shift`, `alt`, `win`. Examples: `space`, `ctrl`, `ctrl+1`, `ctrl+shift+z`, `win+d`.
+Spelling is forgiving: case doesn't matter, spaces around `+` are fine (`Ctrl + 1`), and
+aliases like `spacebar`, `lctrl`, `control`, `return`, `escape`, `pgdn` are accepted. The
+GUI saves bindings in tidy canonical form (`Ctrl + 1` → `ctrl+1`).
+
+Bindings are **hold-means-hold**: the key stays down for as long as the G-key is held.
+Multimedia keys are the tap-only exception.
 
 ### Valid key names
 
 - **Letters:** `a`–`z`
-- **Digits:** `0`–`9`
+- **Digits:** `0`–`9` (top row), `num0`–`num9` (numpad)
 - **Function keys:** `f1`–`f24`
-- **Modifiers:** `ctrl` (`control`), `shift`, `alt`, `win` (`windows`, `super`)
-- **Editing / navigation:** `enter` (`return`), `esc` (`escape`), `space`, `tab`, `backspace`,
-  `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, `up`, `down`, `left`, `right`
+- **Modifiers:** `ctrl`, `shift`, `alt`, `win`; right-hand versions as plain keys: `rctrl`,
+  `rshift`, `ralt`, `rwin`
+- **Editing / navigation:** `enter`, `esc`, `space`, `tab`, `backspace`, `delete`, `insert`,
+  `home`, `end`, `pageup`, `pagedown`, `up`, `down`, `left`, `right`, `menu`
+- **Punctuation:** `minus`, `equals`, `comma`, `period`, `slash`, `semicolon`, `quote`, `hash`,
+  `backslash`, `lbracket`, `rbracket`, `grave` (or the character itself, e.g. `ctrl+-`).
+  These follow your keyboard layout (UK and US differ).
+- **Numpad operators:** `numplus`, `numminus`, `nummultiply`, `numdivide`, `numdecimal`
 - **Locks / misc:** `capslock`, `printscreen`, `pause`, `numlock`, `scrolllock`
-- **Media (tap-only):** `playpause`, `nexttrack` (`next`), `prevtrack` (`prev`), `mediastop`,
-  `volup` (`volumeup`), `voldown` (`volumedown`), `mute`
+- **Media (tap-only):** `playpause`, `nexttrack`, `prevtrack`, `mediastop`, `volup`,
+  `voldown`, `mute`
 
-An invalid key name is rejected (the GUI shows the binding as `bad`).
+An invalid key name is rejected (the GUI marks the row `bad`).
+
+### Macros
+
+G-keys and thumb buttons can run a sequence. Separate steps with commas; each key or combo is
+tapped in turn, and `wait N` (or `delay N` / `Nms`) pauses for N milliseconds (max 60000):
+
+```toml
+[keys]
+G5 = "ctrl+1, wait 150, ctrl+2, wait 150, ctrl+3"
+```
+
+A quick tap of the G-key plays the whole macro once. Tick **repeat** (or add it to `[repeat]`)
+to loop the macro for as long as the G-key is held. Macros run in the background, so long waits
+never block the rest of the pad. Joystick directions take a single key, not macros.
+
+### How keys are sent
+
+Keys are injected as real hardware **scancodes**, so games and apps that read the keyboard
+directly (raw input / DirectInput) see them like a physical key. If a target app runs as
+**Administrator**, Windows blocks input from a non-admin app — run g13-driver the same way.
 
 ## Auto-repeat
 
