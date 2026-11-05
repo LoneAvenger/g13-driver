@@ -1,0 +1,56 @@
+name: Build exe
+
+# Builds g13-driver.exe on every push (any branch) and on demand, and attaches a
+# ready-to-run zip to the run as a downloadable artifact:
+#   Actions tab -> "Build exe" -> latest run -> Artifacts -> g13-driver-windows-x64
+on:
+  push:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: MinGW-w64 gcc (for rusb/libusb)
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+          update: false
+      - name: Put MinGW on PATH
+        shell: bash
+        run: echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
+
+      - name: Install GNU Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Test
+        shell: bash
+        run: cargo test
+
+      - name: Build (release)
+        shell: bash
+        run: cargo build --release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/g13-driver
+          cp target/release/g13-driver.exe dist/g13-driver/
+          cp config.toml dist/g13-driver/
+          cp -r profiles dist/g13-driver/
+          cp README.md dist/g13-driver/
+          cp docs/configuration.md dist/g13-driver/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g13-driver-windows-x64
+          path: dist/g13-driver
